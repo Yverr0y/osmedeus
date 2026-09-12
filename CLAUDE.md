@@ -545,6 +545,59 @@ hooks:
 ```
 Hooks are defined using `WorkflowHooks` in `internal/core/workflow.go`. Pre-scan steps run before the main steps, post-scan steps run after completion.
 
+## Config Environment Overrides
+
+Any settings-file value can be overridden by an environment variable, so secrets
+need not live in `osm-settings.yaml`. The mapping is derived from the YAML field
+names by reflection (`internal/config/envoverride.go`), so a new setting is
+overridable with no extra code: join the YAML path with `_`, upper-case it, prefix
+`OSM_`.
+
+```
+database.username                -> OSM_DATABASE_USERNAME
+server.jwt.secret_signing_key    -> OSM_SERVER_JWT_SECRET_SIGNING_KEY
+server.simple_user_map_key.user1 -> OSM_SERVER_SIMPLE_USER_MAP_KEY_USER1
+```
+
+- Applied in `config.Load()`, `hotreload.loadConfig()`, and the `--settings-file`
+  branch of `pkg/cli/root.go` — **not** in `ParseConfig`/`LoadFromFile`, because
+  `osmedeus config set` round-trips the file through `LoadFromFile` and writes it
+  back, so overriding there would persist env secrets to disk. `config view`
+  therefore reports the file value, not the effective one.
+- Runs before `ResolvePaths()`, so overriding `base_folder` or `environments.*`
+  feeds path resolution.
+- Only YAML-tagged fields are overridable; `yaml:"-"` and untagged fields are
+  skipped (they are derived, not configured). Lists are comma-separated;
+  `map[string]string` entries are addressed by suffixing the key.
+- Environment path defaults come from `defaultEnvironments()` in
+  `internal/config/config.go` — the single source for both `DefaultConfig()` and
+  the partial-settings-file backfill in `ResolvePaths()`.
+
+## Distributed Task Claim Protocol
+
+Workers claim tasks with `BLMOVE` from `osm:tasks:pending` onto a per-worker
+`osm:tasks:processing:{worker_id}` list (`Client.ClaimTask`), **not** `BRPOP`.
+BRPOP is at-most-once: if the worker is canceled or loses its connection between
+Redis handing over the element and the worker recording it, the task is gone and
+no recovery path can see it (the master's sweep only reads `osm:tasks:running`).
+
+Task lifecycle and who protects it at each stage:
+
+| Stage | Lives in | Recovered by |
+|-------|----------|--------------|
+| Submitted | `tasks:pending` | — |
+| Claimed, not yet running | `tasks:processing:{worker}` | `RecoverProcessingTasks` |
+| Running | `tasks:running` hash | `reassignWorkerTasks` |
+
+- `AckTask` clears the claim as soon as `SetTaskRunning` succeeds — that is the
+  handoff point between the two recovery mechanisms.
+- If `SetTaskRunning` fails the worker calls `RequeueTask` instead of executing
+  untracked; a failure there still leaves the task on the processing list.
+- Workers drain their own processing list on startup; the master drains dead
+  workers' lists in `reassignWorkerTasks`, and `recoverOrphanedTasks` sweeps lists
+  belonging to workers that are no longer registered at all.
+- Requires Redis 6.2+ (`BLMOVE`).
+
 ## Queue System
 
 Delayed task execution via database and Redis queues:

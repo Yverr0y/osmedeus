@@ -162,6 +162,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.registerDistributedHooks()
 	defer w.unregisterDistributedHooks()
 
+	// Reclaim anything this worker had in flight when it last stopped.
+	if recovered, err := w.client.RecoverProcessingTasks(ctx, w.ID); err != nil {
+		w.printer.Warning("Failed to recover in-flight tasks: %s", err)
+	} else if recovered > 0 {
+		w.printer.Info("Recovered %d in-flight task(s) from a previous session", recovered)
+	}
+
 	w.printer.Success("Worker %s joined successfully", terminal.Cyan(w.ID))
 	w.printer.Info("Waiting for tasks...")
 
@@ -236,8 +243,10 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 
 // processNextTask waits for and processes the next task
 func (w *Worker) processNextTask(ctx context.Context) error {
-	// Block waiting for a task
-	task, err := w.client.PopTask(ctx, TaskPollTimeout)
+	// Atomically claim a task onto this worker's processing list. Until it is
+	// acknowledged the task stays there, so a crash or a dropped connection
+	// leaves it recoverable instead of losing it.
+	task, payload, err := w.client.ClaimTask(ctx, w.ID, TaskPollTimeout)
 	if err != nil {
 		return err
 	}
@@ -248,10 +257,25 @@ func (w *Worker) processNextTask(ctx context.Context) error {
 	w.printer.Info("Received task %s: %s -> %s",
 		terminal.Cyan(task.ID), terminal.Yellow(task.WorkflowName), terminal.Green(task.Target))
 
-	// Mark task as running
+	// Mark task as running. This is the handoff point: once the task is in the
+	// running hash, the master's dead-worker sweep can reassign it, so the
+	// in-flight claim is no longer what protects it.
 	task.MarkRunning(w.ID)
 	if err := w.client.SetTaskRunning(ctx, task); err != nil {
+		// Never tracked as running -- put it back on the pending queue rather
+		// than executing it untracked. Using a background context so this still
+		// runs when the failure was the worker's context being canceled.
 		w.printer.Warning("Failed to mark task running: %s", err)
+		if reErr := w.client.RequeueTask(context.Background(), w.ID, payload); reErr != nil {
+			// Left on the processing list; recovery will pick it up.
+			w.printer.Warning("Failed to requeue task %s: %s", task.ID, reErr)
+		}
+		return fmt.Errorf("failed to mark task %s running: %w", task.ID, err)
+	}
+
+	// Tracked in the running hash now, so release the in-flight claim.
+	if ackErr := w.client.AckTask(context.Background(), w.ID, payload); ackErr != nil {
+		w.printer.Warning("Failed to acknowledge task %s: %s", task.ID, ackErr)
 	}
 
 	// Update worker status

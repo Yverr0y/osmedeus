@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -337,9 +338,22 @@ func CreateRun(cfg *config.Config, master *distributed.Master) fiber.Handler {
 		loader := parser.NewLoader(cfg.WorkflowsPath)
 		workflow, err := loader.LoadWorkflow(workflowName)
 		if err != nil {
+			logger.Get().Warn("Failed to load workflow",
+				zap.String("workflow", workflowName),
+				zap.String("workflows_path", cfg.WorkflowsPath),
+				zap.Error(err),
+			)
+			// A server with no workflows directory is misconfigured, not a
+			// caller asking for something that does not exist.
+			if errors.Is(err, parser.ErrWorkflowsDirNotConfigured) {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error":   true,
+					"message": "Workflows path is not configured on the server",
+				})
+			}
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"error":   true,
-				"message": "Workflow not found",
+				"message": fmt.Sprintf("Workflow not found: %s", err.Error()),
 			})
 		}
 

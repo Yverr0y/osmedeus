@@ -63,10 +63,8 @@ func (c *Config) Validate() error {
 		c.Server.JWT.ExpirationMinutes = 1440
 	}
 
-	// Set default for snapshot path
-	if c.Environments.Snapshot == "" {
-		c.Environments.Snapshot = "{{base_folder}}/snapshot"
-	}
+	// Environment paths are defaulted by ResolvePaths (applyEnvironmentDefaults),
+	// which every load path calls -- see defaultEnvironments in config.go.
 
 	return nil
 }

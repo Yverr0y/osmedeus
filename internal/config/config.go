@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -804,6 +805,10 @@ func Load(baseFolder string) (*Config, error) {
 		cfg.BaseFolder = baseFolder
 	}
 
+	// Environment overrides win over the settings file, and are applied before
+	// path resolution so an overridden base_folder or environments.* takes effect.
+	ApplyEnvOverrides(cfg)
+
 	// Resolve environment paths
 	cfg.ResolvePaths()
 
@@ -825,11 +830,46 @@ func LoadFromBytes(data []byte) (*Config, error) {
 	return ParseConfig(data)
 }
 
+// defaultEnvironments is the single source of truth for environment paths, used
+// both to build a default config and to backfill a partial settings file.
+//
+// MarkdownReportTemplates and ExternalAgentConfigs are deliberately absent:
+// empty is their meaningful default (no custom templates / no external configs),
+// unlike the paths below where empty means "resolve against the process cwd".
+func defaultEnvironments() EnvironmentConfig {
+	return EnvironmentConfig{
+		ExternalBinariesPath: "{{base_folder}}/external-binaries",
+		ExternalData:         "{{base_folder}}/external-data",
+		ExternalConfigs:      "{{base_folder}}/external-configs",
+		Workspaces:           "{{base_folder}}/workspaces",
+		Workflows:            "{{base_folder}}/workflows",
+		Snapshot:             "{{base_folder}}/snapshot",
+		ExternalScripts:      "{{base_folder}}/external-scripts",
+	}
+}
+
+// applyEnvironmentDefaults fills in any environment path left empty by a partial
+// settings file. Without this, an omitted key resolves to "" and callers silently
+// operate on a relative path rooted at the process working directory.
+func (c *Config) applyEnvironmentDefaults() {
+	defaults := defaultEnvironments()
+	cur := reflect.ValueOf(&c.Environments).Elem()
+	def := reflect.ValueOf(defaults)
+
+	for i := 0; i < cur.NumField(); i++ {
+		if cur.Field(i).String() == "" {
+			cur.Field(i).SetString(def.Field(i).String())
+		}
+	}
+}
+
 // ResolvePaths resolves template variables in environment paths.
 // This method should be called after changing BaseFolder to recalculate all derived paths.
 func (c *Config) ResolvePaths() {
 	baseFolder := c.resolveEnvVars(c.BaseFolder)
 	c.BaseFolder = baseFolder
+
+	c.applyEnvironmentDefaults()
 
 	// Resolve each path with base_folder substitution
 	c.BinariesPath = c.resolvePath(c.Environments.ExternalBinariesPath, baseFolder)
@@ -1142,16 +1182,8 @@ func DefaultConfig() *Config {
 	baseFolder := filepath.Join(homeDir, "osmedeus-base")
 
 	return &Config{
-		BaseFolder: baseFolder,
-		Environments: EnvironmentConfig{
-			ExternalBinariesPath: "{{base_folder}}/external-binaries",
-			ExternalData:         "{{base_folder}}/external-data",
-			ExternalConfigs:      "{{base_folder}}/external-configs",
-			Workspaces:           "{{base_folder}}/workspaces",
-			Workflows:            "{{base_folder}}/workflows",
-			Snapshot:             "{{base_folder}}/snapshot",
-			ExternalScripts:      "{{base_folder}}/external-scripts",
-		},
+		BaseFolder:   baseFolder,
+		Environments: defaultEnvironments(),
 		Database: DatabaseConfig{
 			DBEngine:          "sqlite",
 			DBPath:            "{{base_folder}}/database-osm.sqlite",

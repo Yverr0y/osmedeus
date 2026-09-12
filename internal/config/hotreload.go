@@ -245,6 +245,10 @@ func (h *HotReloadableConfig) loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 
+	// Re-apply environment overrides, otherwise a reload silently reverts every
+	// OSM_* value the process started with to whatever the file says.
+	ApplyEnvOverrides(cfg)
+
 	// Resolve paths
 	cfg.ResolvePaths()
 

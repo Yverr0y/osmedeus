@@ -194,7 +194,11 @@ func (m *Master) checkWorkerHealth(ctx context.Context) {
 	}
 
 	now := time.Now()
+	alive := make(map[string]struct{}, len(workers))
 	for _, worker := range workers {
+		// Registered means not orphaned; only a confirmed death takes it back.
+		alive[worker.ID] = struct{}{}
+
 		heartbeat, err := m.client.GetWorkerHeartbeat(ctx, worker.ID)
 		if err != nil {
 			continue
@@ -212,11 +216,44 @@ func (m *Master) checkWorkerHealth(ctx context.Context) {
 			if err := m.client.RemoveWorker(ctx, worker.ID); err != nil {
 				m.printer.Warning("Failed to remove dead worker: %s", err)
 			}
+			delete(alive, worker.ID)
+		}
+	}
+
+	// Drains the processing lists of every worker just removed above, plus any
+	// left by a worker that vanished while this master was down.
+	m.recoverOrphanedTasks(ctx, alive)
+}
+
+// recoverOrphanedTasks requeues in-flight tasks left behind by workers that are
+// no longer registered at all -- a worker that disappeared while the master was
+// down never goes through the dead-worker path above.
+func (m *Master) recoverOrphanedTasks(ctx context.Context, alive map[string]struct{}) {
+	workerIDs, err := m.client.ListProcessingWorkerIDs(ctx)
+	if err != nil {
+		m.printer.Warning("Failed to list in-flight task lists: %s", err)
+		return
+	}
+
+	for _, workerID := range workerIDs {
+		if _, ok := alive[workerID]; ok {
+			continue // Still heartbeating; its claims are legitimately in flight
+		}
+		recovered, err := m.client.RecoverProcessingTasks(ctx, workerID)
+		if err != nil {
+			m.printer.Warning("Failed to recover orphaned tasks for %s: %s", workerID, err)
+			continue
+		}
+		if recovered > 0 {
+			m.printer.Info("Recovered %d orphaned task(s) from unregistered worker %s",
+				recovered, terminal.Cyan(workerID))
 		}
 	}
 }
 
 // reassignWorkerTasks moves a dead worker's tasks back to pending
+// Tasks the worker claimed but never marked running live on its processing list
+// rather than in the running hash; recoverOrphanedTasks drains those.
 func (m *Master) reassignWorkerTasks(ctx context.Context, workerID string) {
 	tasks, err := m.client.GetAllRunningTasks(ctx)
 	if err != nil {

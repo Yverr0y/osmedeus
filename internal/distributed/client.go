@@ -20,6 +20,7 @@ const (
 	KeyTasksPending     = KeyPrefix + "tasks:pending"
 	KeyTasksRunning     = KeyPrefix + "tasks:running"
 	KeyTasksCompleted   = KeyPrefix + "tasks:completed"
+	KeyTasksProcessing  = KeyPrefix + "tasks:processing:" // osm:tasks:processing:{worker_id}
 	KeyWorkers          = KeyPrefix + "workers"
 	KeyWorkersHeartbeat = KeyPrefix + "workers:heartbeat"
 	KeyMasterLock       = KeyPrefix + "master:lock"
@@ -35,6 +36,14 @@ const (
 	KeyDataExecute       = KeyPrefix + "data:execute"
 	KeyDataExecuteWorker = KeyPrefix + "data:execute:worker:" // osm:data:execute:worker:{worker_id}
 )
+
+// KeyTasksProcessingForWorker returns the per-worker in-flight task list key.
+// A task lives here between being claimed off the pending queue and being
+// recorded in KeyTasksRunning, so a worker that dies in that window does not
+// take the task with it.
+func KeyTasksProcessingForWorker(workerID string) string {
+	return KeyTasksProcessing + workerID
+}
 
 // KeyDataExecuteForWorker returns the per-worker execute queue key.
 func KeyDataExecuteForWorker(workerID string) string {
@@ -158,7 +167,13 @@ func (c *Client) PushTask(ctx context.Context, task *Task) error {
 	return c.client.Do(ctx, cmd).Error()
 }
 
-// PopTask pops a task from the pending queue (blocking)
+// PopTask pops a task from the pending queue (blocking).
+//
+// Deprecated: BRPOP is at-most-once -- if the caller dies, is canceled, or loses
+// the connection between Redis popping the element and the caller recording it,
+// the task is gone for good. Use ClaimTask, which moves the task to a per-worker
+// processing list in the same atomic step. Retained for the task-queue poller in
+// pkg/cli/worker_queue.go, which re-queues from the database instead.
 func (c *Client) PopTask(ctx context.Context, timeout time.Duration) (*Task, error) {
 	cmd := c.client.B().Brpop().Key(KeyTasksPending).Timeout(timeout.Seconds()).Build()
 	result, err := c.client.Do(ctx, cmd).AsStrSlice()
@@ -174,6 +189,117 @@ func (c *Client) PopTask(ctx context.Context, timeout time.Duration) (*Task, err
 	}
 
 	return UnmarshalTask([]byte(result[1]))
+}
+
+// ClaimTask atomically moves a task from the pending queue onto the calling
+// worker's processing list and returns it, along with the raw payload needed to
+// acknowledge it later.
+//
+// The move is a single BLMOVE, so the task is never held only in the worker's
+// memory: if the worker dies before finishing, the task stays on its processing
+// list and RecoverProcessingTasks puts it back. Requires Redis 6.2+.
+func (c *Client) ClaimTask(ctx context.Context, workerID string, timeout time.Duration) (*Task, string, error) {
+	// RIGHT off pending keeps FIFO order (PushTask LPUSHes onto the head).
+	cmd := c.client.B().Blmove().
+		Source(KeyTasksPending).
+		Destination(KeyTasksProcessingForWorker(workerID)).
+		Right().
+		Left().
+		Timeout(timeout.Seconds()).
+		Build()
+
+	payload, err := c.client.Do(ctx, cmd).ToString()
+	if err != nil {
+		if rueidis.IsRedisNil(err) {
+			return nil, "", nil // Timeout, no task available
+		}
+		return nil, "", fmt.Errorf("failed to claim task: %w", err)
+	}
+
+	task, err := UnmarshalTask([]byte(payload))
+	if err != nil {
+		// Payload is unusable; drop it from the processing list so it does not
+		// get replayed forever on every recovery sweep.
+		_ = c.AckTask(ctx, workerID, payload)
+		return nil, "", fmt.Errorf("failed to unmarshal claimed task: %w", err)
+	}
+
+	return task, payload, nil
+}
+
+// AckTask removes a claimed task from a worker's processing list, marking it as
+// no longer in flight. Safe to call more than once.
+func (c *Client) AckTask(ctx context.Context, workerID, payload string) error {
+	cmd := c.client.B().Lrem().
+		Key(KeyTasksProcessingForWorker(workerID)).
+		Count(1).
+		Element(payload).
+		Build()
+	return c.client.Do(ctx, cmd).Error()
+}
+
+// RequeueTask returns a single claimed task to the pending queue. If the LREM
+// succeeds but the push does not, the task stays on the processing list and is
+// picked up by RecoverProcessingTasks, so no path drops it.
+func (c *Client) RequeueTask(ctx context.Context, workerID, payload string) error {
+	task, err := UnmarshalTask([]byte(payload))
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal task for requeue: %w", err)
+	}
+	if err := c.PushTask(ctx, task); err != nil {
+		return err
+	}
+	return c.AckTask(ctx, workerID, payload)
+}
+
+// RecoverProcessingTasks moves every task still on a worker's processing list
+// back onto the pending queue and returns how many were recovered. Used when a
+// worker is found dead, and by a worker itself on startup to reclaim tasks it
+// lost to an earlier crash.
+func (c *Client) RecoverProcessingTasks(ctx context.Context, workerID string) (int, error) {
+	key := KeyTasksProcessingForWorker(workerID)
+	recovered := 0
+
+	for {
+		// Onto the tail of pending, so a recovered task is taken next rather
+		// than queueing behind everything submitted while the worker was down.
+		cmd := c.client.B().Lmove().
+			Source(key).
+			Destination(KeyTasksPending).
+			Right().
+			Right().
+			Build()
+
+		if err := c.client.Do(ctx, cmd).Error(); err != nil {
+			if rueidis.IsRedisNil(err) {
+				return recovered, nil // List drained
+			}
+			return recovered, fmt.Errorf("failed to recover in-flight tasks: %w", err)
+		}
+		recovered++
+	}
+}
+
+// ListProcessingWorkerIDs returns the worker IDs that currently have a
+// processing list in Redis, including workers that are no longer registered.
+func (c *Client) ListProcessingWorkerIDs(ctx context.Context) ([]string, error) {
+	var ids []string
+	cursor := uint64(0)
+
+	for {
+		cmd := c.client.B().Scan().Cursor(cursor).Match(KeyTasksProcessing + "*").Count(100).Build()
+		entry, err := c.client.Do(ctx, cmd).AsScanEntry()
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan processing lists: %w", err)
+		}
+		for _, key := range entry.Elements {
+			ids = append(ids, strings.TrimPrefix(key, KeyTasksProcessing))
+		}
+		if entry.Cursor == 0 {
+			return ids, nil
+		}
+		cursor = entry.Cursor
+	}
 }
 
 // SetTaskRunning moves a task to the running hash

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,12 @@ type CacheEntry struct {
 	FilePath string    // Absolute path for mtime check
 	ModTime  time.Time // File modification time when cached
 }
+
+// ErrWorkflowsDirNotConfigured is returned when a Loader was built with an empty
+// workflows directory. Every lookup would otherwise resolve against the process
+// working directory and report a misleading "workflow not found", which is what
+// made this misconfiguration so hard to diagnose from the API.
+var ErrWorkflowsDirNotConfigured = errors.New("workflows directory is not configured")
 
 // Loader loads and caches workflows
 type Loader struct {
@@ -146,6 +153,9 @@ func (l *Loader) LoadWorkflowByPath(path string) (*core.Workflow, error) {
 			return nil, fmt.Errorf("workflow file not found: %s", absPath)
 		} else {
 			// File doesn't exist relative to CWD, try relative to workflowsDir
+			if l.workflowsDir == "" {
+				return nil, ErrWorkflowsDirNotConfigured
+			}
 			log.Debug("Workflow not found at relative path, trying workflows directory",
 				zap.String("original_path", path),
 				zap.String("workflows_dir", l.workflowsDir),
@@ -359,6 +369,10 @@ func isWorkflowYAML(path string) bool {
 // findYAMLFiles finds all YAML files in a directory
 func (l *Loader) findYAMLFiles(dir string, recursive bool) ([]string, error) {
 	var files []string
+
+	if dir == "" {
+		return nil, ErrWorkflowsDirNotConfigured
+	}
 
 	if recursive {
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {

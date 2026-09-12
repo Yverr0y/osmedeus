@@ -1,6 +1,28 @@
 # Osmedeus Configuration File
 # This file contains all available configuration options for osmedeus.
 # Copy this file to ~/osmedeus-base/osm-settings.yaml and customize as needed.
+#
+# =============================================================================
+# Environment Variable Overrides
+# =============================================================================
+# Any value below can be overridden by an environment variable, so secrets do
+# not have to be committed to this file. Build the variable name by joining the
+# YAML path with underscores, upper-casing it, and prefixing it with OSM_:
+#
+#   database.username                -> OSM_DATABASE_USERNAME
+#   database.password                -> OSM_DATABASE_PASSWORD
+#   redis.password                   -> OSM_REDIS_PASSWORD
+#   server.jwt.secret_signing_key    -> OSM_SERVER_JWT_SECRET_SIGNING_KEY
+#   server.auth_api_key              -> OSM_SERVER_AUTH_API_KEY
+#   server.simple_user_map_key.user1 -> OSM_SERVER_SIMPLE_USER_MAP_KEY_USER1
+#
+# The environment always wins over the value in this file. Lists are
+# comma-separated. Map entries (such as simple_user_map_key) are addressed by
+# appending the entry name to the map's path.
+#
+# `osmedeus config view` intentionally reports what is written in this file, not
+# the effective value, so that `osmedeus config set` never writes an
+# environment-supplied secret back to disk.
 
 # =============================================================================
 # Base Folder

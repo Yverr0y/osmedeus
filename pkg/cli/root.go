@@ -183,6 +183,11 @@ var rootCmd = &cobra.Command{
 			if cfg.BaseFolder == "" {
 				cfg.BaseFolder = baseFolder
 			}
+			// LoadFromFile only unmarshals; apply env overrides and resolve the
+			// derived runtime paths (WorkflowsPath, WorkspacesPath, ...), which
+			// stay empty otherwise. config.Load does both for the default path.
+			config.ApplyEnvOverrides(cfg)
+			cfg.ResolvePaths()
 		} else {
 			logger.Get().Debug("Loading configuration",
 				zap.String("base_folder", baseFolder),
